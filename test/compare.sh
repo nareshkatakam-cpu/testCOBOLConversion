@@ -10,6 +10,8 @@
 #       docker run -d --name oracle -e ORACLE_PASSWORD=... -e APP_USER=payroll \
 #         -e APP_USER_PASSWORD=payroll -v "$ORACLE_DATA_HOST_DIR":/opt/payroll_data \
 #         gvenzl/oracle-free:23-slim-faststart
+#
+# Set RESULTS_DIR to keep each case's report/console output from both programs.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -68,6 +70,12 @@ if [[ ! -e "$WORK/missing/cobol/PAYROLL_REPORT.TXT" && ! -e "$WORK/missing/plsql
   echo "PASS missing-input"
 else
   echo "FAIL missing-input"; status=1
+fi
+
+if [[ -n "${RESULTS_DIR:-}" ]]; then
+  mkdir -p "$RESULTS_DIR"
+  cp -r "$WORK"/. "$RESULTS_DIR"/
+  rm -f "$RESULTS_DIR/payroll"
 fi
 
 exit $status
