@@ -1,0 +1,167 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. PAYROLL-PROCESSOR.
+       AUTHOR.     EXPERT-COBOL-DEV.
+
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT EMP-FILE ASSIGN TO "EMPLOYEE.DAT"
+               ORGANIZATION IS LINE SEQUENTIAL
+               FILE STATUS IS WS-EMP-STATUS.
+               
+           SELECT REPORT-FILE ASSIGN TO "PAYROLL_REPORT.TXT"
+               ORGANIZATION IS LINE SEQUENTIAL
+               FILE STATUS IS WS-REP-STATUS.
+
+       DATA DIVISION.
+       FILE SECTION.
+       FD  EMP-FILE.
+       01  EMP-RECORD.
+           05  EMP-ID          PIC X(5).
+           05  EMP-NAME        PIC X(25).
+           05  EMP-DEPT        PIC X(4).
+           05  EMP-HOURS       PIC 9(3)V99.
+           05  EMP-HOURLY-RATE PIC 9(3)V99.
+           05  EMP-TYPE        PIC X(1).
+               88  IS-HOURLY   VALUE 'H'.
+               88  IS-SALARIED VALUE 'S'.
+
+       FD  REPORT-FILE.
+       01  REPORT-RECORD       PIC X(80).
+
+       WORKING-STORAGE SECTION.
+       01  WS-FILE-STATUSES.
+           05  WS-EMP-STATUS   PIC X(2).
+               88  EMP-EOF     VALUE "10".
+               88  EMP-SUCCESS VALUE "00".
+           05  WS-REP-STATUS   PIC X(2).
+
+       01  WS-FLAGS.
+           05  WS-VALID-RECORD-FLAG PIC X(1).
+               88  RECORD-VALID     VALUE 'Y'.
+               88  RECORD-INVALID   VALUE 'N'.
+
+       01  WS-CALCULATION-VARIABLES.
+           05  WS-REG-HOURS     PIC 9(3)V99 COMP-3 VALUE ZERO.
+           05  WS-OT-HOURS      PIC 9(3)V99 COMP-3 VALUE ZERO.
+           05  WS-GROSS-PAY     PIC 9(5)V99 COMP-3 VALUE ZERO.
+           05  WS-TAX-DIVISOR   PIC 9(1)V99 COMP-3 VALUE 4.00.
+           05  WS-TAX-AMOUNT    PIC 9(5)V99 COMP-3 VALUE ZERO.
+           05  WS-NET-PAY       PIC 9(5)V99 COMP-3 VALUE ZERO.
+
+       01  WS-TOTALS.
+           05  WS-TOTAL-EMPLOYEES PIC 9(4) COMP VALUE ZERO.
+           05  WS-TOTAL-PAYROLL   PIC 9(7)V99 COMP-3 VALUE ZERO.
+
+       01  WS-REPORT-LINES.
+           05  HDR-LINE-1.
+               10  FILLER       PIC X(28) VALUE SPACES.
+               10  FILLER       PIC X(24) VALUE "PAYROLL PROCESSING REPORT".
+               10  FILLER       PIC X(28) VALUE SPACES.
+           05  HDR-LINE-2.
+               10  FILLER       PIC X(80) VALUE ALL "=".
+           05  DATA-LINE.
+               10  DET-ID       PIC X(5).
+               10  FILLER       PIC X(3)  VALUE SPACES.
+               10  DET-NAME     PIC X(25).
+               10  FILLER       PIC X(2)  VALUE SPACES.
+               10  DET-DEPT     PIC X(4).
+               10  FILLER       PIC X(4)  VALUE SPACES.
+               10  DET-GROSS    PIC $Z(4)9.99.
+               10  FILLER       PIC X(4)  VALUE SPACES.
+               10  DET-NET      PIC $Z(4)9.99.
+               10  FILLER       PIC X(13) VALUE SPACES.
+           05  TOTALS-LINE.
+               10  FILLER       PIC X(39) VALUE "TOTAL EMPLOYEES PROCESSED:".
+               10  TOT-COUNT    PIC ZZZ9.
+               10  FILLER       PIC X(5)  VALUE "    ".
+               10  FILLER       PIC X(14) VALUE "TOTAL PAYROLL:".
+               10  TOT-PAYROLL  PIC $Z,ZZZ,Z9.99.
+               10  FILLER       PIC X(6)  VALUE SPACES.
+
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           PERFORM 1000-INITIALIZE
+           PERFORM 2000-PROCESS-DATA UNTIL EMP-EOF
+           PERFORM 3000-TERMINATE
+           STOP RUN.
+
+       1000-INITIALIZE.
+           OPEN INPUT EMP-FILE
+           IF NOT EMP-SUCCESS
+               DISPLAY "ERROR OPENING EMPLOYEE FILE: " WS-EMP-STATUS
+               STOP RUN
+           END-IF.
+           
+           OPEN OUTPUT REPORT-FILE
+           WRITE REPORT-RECORD FROM HDR-LINE-1
+           WRITE REPORT-RECORD FROM HDR-LINE-2
+           PERFORM 1100-READ-EMPLOYEE.
+
+       1100-READ-EMPLOYEE.
+           READ EMP-FILE
+               AT END
+                   SET EMP-EOF TO TRUE
+           END-READ.
+
+       2000-PROCESS-DATA.
+           SET RECORD-VALID TO TRUE
+           PERFORM 2100-VALIDATE-RECORD
+           
+           IF RECORD-VALID
+               PERFORM 2200-CALCULATE-PAY
+               PERFORM 2300-ACCUMULATE-TOTALS
+               PERFORM 2400-WRITE-REPORT-LINE
+           END-IF
+           
+           PERFORM 1100-READ-EMPLOYEE.
+
+       2100-VALIDATE-RECORD.
+           IF EMP-HOURS NOT NUMERIC OR EMP-HOURLY-RATE NOT NUMERIC
+               DISPLAY "INVALID NUMERIC DATA FOR EMP: " EMP-ID
+               SET RECORD-INVALID TO TRUE
+           END-IF.
+           IF NOT IS-HOURLY AND NOT IS-SALARIED
+               DISPLAY "INVALID EMPLOYEE TYPE FOR EMP: " EMP-ID
+               SET RECORD-INVALID TO TRUE
+           END-IF.
+
+       2200-CALCULATE-PAY.
+           EVALUATE TRUE
+               WHEN IS-SALARIED
+                   COMPUTE WS-GROSS-PAY = EMP-HOURS * EMP-HOURLY-RATE
+               WHEN IS-HOURLY
+                   IF EMP-HOURS > 40.00
+                       MOVE 40.00 TO WS-REG-HOURS
+                       SUBTRACT 40.00 FROM EMP-HOURS GIVING WS-OT-HOURS
+                   ELSE
+                       MOVE EMP-HOURS TO WS-REG-HOURS
+                       MOVE ZERO TO WS-OT-HOURS
+                   END-IF
+                   COMPUTE WS-GROSS-PAY = (WS-REG-HOURS * EMP-HOURLY-RATE) +
+                                         (WS-OT-HOURS * EMP-HOURLY-RATE * 1.5)
+           END-EVALUATE
+           
+           COMPUTE WS-TAX-AMOUNT ROUNDED = WS-GROSS-PAY / WS-TAX-DIVISOR
+           SUBTRACT WS-TAX-AMOUNT FROM WS-GROSS-PAY GIVING WS-NET-PAY.
+
+       2300-ACCUMULATE-TOTALS.
+           ADD 1 TO WS-TOTAL-EMPLOYEES
+           ADD WS-NET-PAY TO WS-TOTAL-PAYROLL.
+
+       2400-WRITE-REPORT-LINE.
+           INITIALIZE DATA-LINE
+           MOVE EMP-ID TO DET-ID
+           MOVE EMP-NAME TO DET-NAME
+           MOVE EMP-DEPT TO DET-DEPT
+           MOVE WS-GROSS-PAY TO DET-GROSS
+           MOVE WS-NET-PAY TO DET-NET
+           WRITE REPORT-RECORD FROM DATA-LINE.
+
+       3000-TERMINATE.
+           WRITE REPORT-RECORD FROM HDR-LINE-2
+           MOVE WS-TOTAL-EMPLOYEES TO TOT-COUNT
+           MOVE WS-TOTAL-PAYROLL TO TOT-PAYROLL
+           WRITE REPORT-RECORD FROM TOTALS-LINE
+           CLOSE EMP-FILE
+                 REPORT-FILE.
