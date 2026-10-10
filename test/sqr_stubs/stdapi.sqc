@@ -1,0 +1,12 @@
+! Test stub for PeopleSoft stdapi.sqc: behaves as a standalone run
+! (no Process Scheduler request, process instance 0).
+begin-procedure Stdapi-Init
+  let #prcs_process_instance = 0
+  let #prcs_run_status_error = 3
+end-procedure
+
+begin-procedure Stdapi-Term
+end-procedure
+
+begin-procedure Update-Prcs-Run-Status
+end-procedure
