@@ -1,0 +1,383 @@
+!***********************************************************************
+!  ZPAYPROC.SQR:  Payroll Processing Report                             *
+!                                                                       *
+!  Conversion of the COBOL program PAYROLL-PROCESSOR                    *
+!  (sampleCOBOLprogram).  Reads the fixed-format employee file, computes*
+!  gross/net pay and writes an 80-column payroll report file.           *
+!                                                                       *
+!  Runs under PeopleSoft Process Scheduler (scheduled from the          *
+!  Application Engine program Z_PAYPROC) or standalone from the command *
+!  line.  Under Process Scheduler the file names come from run control  *
+!  record Z_RUNCTL_PAYPRC; standalone it uses EMPLOYEE.DAT and          *
+!  PAYROLL_REPORT.TXT in the current directory, like the COBOL program. *
+!                                                                       *
+!  COBOL data semantics are preserved: unsigned fixed-point fields      *
+!  truncate excess decimals and high-order digits (Fit-Numeric),        *
+!  COMPUTE ROUNDED rounds half away from zero, and numeric-edited       *
+!  pictures are reproduced by Edit-Numeric.                             *
+!***********************************************************************
+
+#include 'setenv.sqc'   ! Set environment
+
+#define DEFAULT_EMP_FILE     EMPLOYEE.DAT
+#define DEFAULT_REPORT_FILE  PAYROLL_REPORT.TXT
+#define EMP_RECORD_LEN       45
+#define REPORT_WIDTH         80
+#define MAX_LINE_LEN         32767
+#define EMP_FILE_NUM         1
+#define REPORT_FILE_NUM      2
+
+begin-setup
+  declare-variable
+    default-numeric=decimal(38)
+  end-declare
+end-setup
+
+!***********************************************************************
+begin-program
+  do Stdapi-Init
+  do Get-Run-Control
+  do Process-Main
+  if $Process_Failed = 'Y'
+    do Set-Process-Error
+  else
+    do Stdapi-Term
+  end-if
+end-program
+
+!***********************************************************************
+! Run control: file names (Process Scheduler) or COBOL defaults
+!***********************************************************************
+begin-procedure Get-Run-Control
+  let $Emp_File_Name = '{DEFAULT_EMP_FILE}'
+  let $Report_File_Name = '{DEFAULT_REPORT_FILE}'
+  if #prcs_process_instance > 0
+    do Select-Run-Control
+  end-if
+end-procedure
+
+begin-procedure Select-Run-Control
+begin-select
+RC.Z_EMP_FILE
+RC.Z_REPORT_FILE
+  if not isblank(&RC.Z_EMP_FILE)
+    let $Emp_File_Name = rtrim(&RC.Z_EMP_FILE, ' ')
+  end-if
+  if not isblank(&RC.Z_REPORT_FILE)
+    let $Report_File_Name = rtrim(&RC.Z_REPORT_FILE, ' ')
+  end-if
+FROM PS_Z_RUNCTL_PAYPRC RC
+WHERE RC.OPRID = $prcs_oprid
+  AND RC.RUN_CNTL_ID = $prcs_run_cntl_id
+end-select
+end-procedure
+
+!***********************************************************************
+! Mark the Process Scheduler request as Error (RUNSTATUS 3) so the
+! calling Application Engine step fails.
+!***********************************************************************
+begin-procedure Set-Process-Error
+  if #prcs_process_instance > 0
+    let #prcs_run_status = #prcs_run_status_error
+    do Update-Prcs-Run-Status
+    commit
+  end-if
+end-procedure
+
+!***********************************************************************
+! 0000-MAIN
+!***********************************************************************
+begin-procedure Process-Main
+  let $Process_Failed = 'N'
+  do Initialize-Processing
+  if $Process_Failed = 'N'
+    while $Emp_Eof = 'N'
+      do Process-Employee
+    end-while
+    do Terminate-Processing
+  end-if
+end-procedure
+
+!***********************************************************************
+! 1000-INITIALIZE
+!***********************************************************************
+begin-procedure Initialize-Processing
+  let $Emp_Eof = 'N'
+  let #Total_Employees = 0
+  let #Total_Payroll = 0
+
+  open $Emp_File_Name as {EMP_FILE_NUM} for-reading record={MAX_LINE_LEN}:vary status=#Emp_Status
+  if #Emp_Status <> 0
+    let $Message = 'ERROR OPENING EMPLOYEE FILE: ' || $Emp_File_Name
+    display $Message
+    let $Process_Failed = 'Y'
+  else
+    open $Report_File_Name as {REPORT_FILE_NUM} for-writing record={REPORT_WIDTH}:vary status=#Rep_Status
+    if #Rep_Status <> 0
+      let $Message = 'ERROR OPENING REPORT FILE: ' || $Report_File_Name
+      display $Message
+      close {EMP_FILE_NUM}
+      let $Process_Failed = 'Y'
+    else
+      do Build-Header-Lines
+      let $Out_Line = $Hdr_Line_1
+      do Write-Report-Record
+      let $Out_Line = $Hdr_Line_2
+      do Write-Report-Record
+      do Read-Employee
+    end-if
+  end-if
+end-procedure
+
+!***********************************************************************
+! 1100-READ-EMPLOYEE
+!***********************************************************************
+begin-procedure Read-Employee
+  read {EMP_FILE_NUM} into $Emp_Line:{MAX_LINE_LEN}
+  if #end-file
+    let $Emp_Eof = 'Y'
+  end-if
+end-procedure
+
+!***********************************************************************
+! 2000-PROCESS-DATA
+!***********************************************************************
+begin-procedure Process-Employee
+  do Parse-Employee-Record
+  let $Record_Valid = 'Y'
+  do Validate-Record
+
+  if $Record_Valid = 'Y'
+    do Calculate-Pay
+    do Accumulate-Totals
+    do Write-Report-Line
+  end-if
+
+  do Read-Employee
+end-procedure
+
+!***********************************************************************
+! EMP-RECORD layout (45 bytes; short lines are space filled, long lines
+! are truncated, as for a LINE SEQUENTIAL read)
+!***********************************************************************
+begin-procedure Parse-Employee-Record
+  do Pic-X($Emp_Line, {EMP_RECORD_LEN}, $Emp_Rec)
+  let $Emp_Id = substr($Emp_Rec, 1, 5)
+  let $Emp_Name = substr($Emp_Rec, 6, 25)
+  let $Emp_Dept = substr($Emp_Rec, 31, 4)
+  let $Emp_Hours_Raw = substr($Emp_Rec, 35, 5)
+  let $Emp_Rate_Raw = substr($Emp_Rec, 40, 5)
+  let $Emp_Type = substr($Emp_Rec, 45, 1)
+
+  let #Emp_Hours = 0
+  let #Emp_Hourly_Rate = 0
+  do Is-Numeric-Field($Emp_Hours_Raw, $Hours_Numeric)
+  do Is-Numeric-Field($Emp_Rate_Raw, $Rate_Numeric)
+  if $Hours_Numeric = 'Y'
+    let #Emp_Hours = to_number($Emp_Hours_Raw) / 100
+  end-if
+  if $Rate_Numeric = 'Y'
+    let #Emp_Hourly_Rate = to_number($Emp_Rate_Raw) / 100
+  end-if
+end-procedure
+
+!***********************************************************************
+! 2100-VALIDATE-RECORD
+!***********************************************************************
+begin-procedure Validate-Record
+  if $Hours_Numeric = 'N' or $Rate_Numeric = 'N'
+    let $Message = 'INVALID NUMERIC DATA FOR EMP: ' || $Emp_Id
+    display $Message
+    let $Record_Valid = 'N'
+  end-if
+  if $Emp_Type <> 'H' and $Emp_Type <> 'S'
+    let $Message = 'INVALID EMPLOYEE TYPE FOR EMP: ' || $Emp_Id
+    display $Message
+    let $Record_Valid = 'N'
+  end-if
+end-procedure
+
+!***********************************************************************
+! 2200-CALCULATE-PAY
+!***********************************************************************
+begin-procedure Calculate-Pay
+  if $Emp_Type = 'S'
+    let #Work_Amount = #Emp_Hours * #Emp_Hourly_Rate
+    do Fit-Numeric(#Work_Amount, 5, 2, #Gross_Pay)
+  else
+    if #Emp_Hours > 40.00
+      let #Reg_Hours = 40.00
+      let #Work_Amount = #Emp_Hours - 40.00
+      do Fit-Numeric(#Work_Amount, 3, 2, #Ot_Hours)
+    else
+      let #Reg_Hours = #Emp_Hours
+      let #Ot_Hours = 0
+    end-if
+    let #Work_Amount = (#Reg_Hours * #Emp_Hourly_Rate) + (#Ot_Hours * #Emp_Hourly_Rate * 1.5)
+    do Fit-Numeric(#Work_Amount, 5, 2, #Gross_Pay)
+  end-if
+
+  let #Work_Amount = round(#Gross_Pay / 4.00, 2)
+  do Fit-Numeric(#Work_Amount, 5, 2, #Tax_Amount)
+  let #Work_Amount = #Gross_Pay - #Tax_Amount
+  do Fit-Numeric(#Work_Amount, 5, 2, #Net_Pay)
+end-procedure
+
+!***********************************************************************
+! 2300-ACCUMULATE-TOTALS
+!***********************************************************************
+begin-procedure Accumulate-Totals
+  let #Work_Amount = #Total_Employees + 1
+  do Fit-Numeric(#Work_Amount, 4, 0, #Total_Employees)
+  let #Work_Amount = #Total_Payroll + #Net_Pay
+  do Fit-Numeric(#Work_Amount, 7, 2, #Total_Payroll)
+end-procedure
+
+!***********************************************************************
+! 2400-WRITE-REPORT-LINE  (DATA-LINE)
+!***********************************************************************
+begin-procedure Write-Report-Line
+  do Pic-X($Emp_Id, 5, $Det_Id)
+  do Pic-X($Emp_Name, 25, $Det_Name)
+  do Pic-X($Emp_Dept, 4, $Det_Dept)
+  do Edit-Numeric(#Gross_Pay, '$ZZZZ9.99', $Det_Gross)
+  do Edit-Numeric(#Net_Pay, '$ZZZZ9.99', $Det_Net)
+  let $Out_Line = $Det_Id || '   ' || $Det_Name || '  ' || $Det_Dept || '    ' || $Det_Gross || '    ' || $Det_Net
+  do Write-Report-Record
+end-procedure
+
+!***********************************************************************
+! 3000-TERMINATE  (TOTALS-LINE)
+!***********************************************************************
+begin-procedure Terminate-Processing
+  let $Out_Line = $Hdr_Line_2
+  do Write-Report-Record
+
+  do Pic-X('TOTAL EMPLOYEES PROCESSED:', 39, $Tot_Label_1)
+  do Pic-X('TOTAL PAYROLL:', 14, $Tot_Label_2)
+  do Edit-Numeric(#Total_Employees, 'ZZZ9', $Tot_Count)
+  do Edit-Numeric(#Total_Payroll, '$Z,ZZZ,Z9.99', $Tot_Payroll)
+  let $Out_Line = $Tot_Label_1 || $Tot_Count || '     ' || $Tot_Label_2 || $Tot_Payroll
+  do Write-Report-Record
+
+  close {EMP_FILE_NUM}
+  close {REPORT_FILE_NUM}
+end-procedure
+
+!***********************************************************************
+! HDR-LINE-1 / HDR-LINE-2
+!***********************************************************************
+begin-procedure Build-Header-Lines
+  do Pic-X(' ', 28, $Hdr_Filler)
+  do Pic-X('PAYROLL PROCESSING REPORT', 24, $Hdr_Title)
+  let $Hdr_Line_1 = $Hdr_Filler || $Hdr_Title || $Hdr_Filler
+  let $Hdr_Line_2 = rpad('=', {REPORT_WIDTH}, '=')
+end-procedure
+
+!***********************************************************************
+! WRITE REPORT-RECORD (PIC X(80))
+!***********************************************************************
+begin-procedure Write-Report-Record
+  write {REPORT_FILE_NUM} from $Out_Line:{REPORT_WIDTH}
+end-procedure
+
+!***********************************************************************
+! Helpers
+!***********************************************************************
+
+! MOVE to PIC X(n): truncate or space fill to exactly n characters.
+begin-procedure Pic-X($Value, #Length, :$Result)
+  let $Result = rpad(substr($Value, 1, #Length), #Length, ' ')
+end-procedure
+
+! COBOL NUMERIC class test for an unsigned DISPLAY field.
+begin-procedure Is-Numeric-Field($Field, :$Is_Numeric)
+  let #Field_Length = length($Field)
+  if #Field_Length = 0
+    let $Is_Numeric = 'N'
+  else
+    let $Is_Numeric = 'Y'
+  end-if
+  let #Pos = 1
+  while #Pos <= #Field_Length
+    let $Char = substr($Field, #Pos, 1)
+    if $Char < '0' or $Char > '9'
+      let $Is_Numeric = 'N'
+    end-if
+    let #Pos = #Pos + 1
+  end-while
+end-procedure
+
+! Store into an unsigned PIC 9(Int_Digits)V9(Dec_Digits) field: drop the
+! sign, truncate excess decimals and high-order integer digits.
+begin-procedure Fit-Numeric(#Value, #Int_Digits, #Dec_Digits, :#Result)
+  let #Truncated = trunc(abs(#Value), #Dec_Digits)
+  let #Modulus = power(10, #Int_Digits)
+  let #Result = #Truncated - (trunc(#Truncated / #Modulus, 0) * #Modulus)
+end-procedure
+
+! MOVE to a numeric-edited picture built from $ , . Z 9 (and literal
+! characters).  Z suppresses leading zeros (and commas) until the first
+! non-zero digit or the decimal point.
+begin-procedure Edit-Numeric(#Value, $Picture, :$Result)
+  let #Pic_Length = length($Picture)
+  let #Int_Digits = 0
+  let #Dec_Digits = 0
+  let $After_Point = 'N'
+  let #Pos = 1
+  while #Pos <= #Pic_Length
+    let $Char = substr($Picture, #Pos, 1)
+    if $Char = '.'
+      let $After_Point = 'Y'
+    else
+      if $Char = 'Z' or $Char = '9'
+        if $After_Point = 'Y'
+          let #Dec_Digits = #Dec_Digits + 1
+        else
+          let #Int_Digits = #Int_Digits + 1
+        end-if
+      end-if
+    end-if
+    let #Pos = #Pos + 1
+  end-while
+
+  do Fit-Numeric(#Value, #Int_Digits, #Dec_Digits, #Fitted)
+  let #Scaled = #Fitted * power(10, #Dec_Digits)
+  let #Remaining_Digits = #Int_Digits + #Dec_Digits
+
+  let $Result = ''
+  let $Suppressing = 'Y'
+  let #Pos = 1
+  while #Pos <= #Pic_Length
+    let $Char = substr($Picture, #Pos, 1)
+    if $Char = 'Z' or $Char = '9'
+      let #Remaining_Digits = #Remaining_Digits - 1
+      let #Place = power(10, #Remaining_Digits)
+      let #Digit = trunc(#Scaled / #Place, 0) - (trunc(#Scaled / (#Place * 10), 0) * 10)
+      let $Digit = substr('0123456789', #Digit + 1, 1)
+      if $Suppressing = 'Y' and $Char = 'Z' and $Digit = '0'
+        let $Result = $Result || ' '
+      else
+        let $Suppressing = 'N'
+        let $Result = $Result || $Digit
+      end-if
+    else
+      if $Char = ','
+        if $Suppressing = 'Y'
+          let $Result = $Result || ' '
+        else
+          let $Result = $Result || ','
+        end-if
+      else
+        if $Char = '.'
+          let $Suppressing = 'N'
+        end-if
+        let $Result = $Result || $Char
+      end-if
+    end-if
+    let #Pos = #Pos + 1
+  end-while
+end-procedure
+
+!***********************************************************************
+#include 'stdapi.sqc'    ! Process Scheduler interface (Stdapi-Init/Term)

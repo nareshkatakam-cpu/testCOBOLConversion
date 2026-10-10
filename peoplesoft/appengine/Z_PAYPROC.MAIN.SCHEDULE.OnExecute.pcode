@@ -1,0 +1,21 @@
+/* Application Engine Z_PAYPROC, section MAIN, step SCHEDULE, PeopleCode action.  */
+/* Schedules SQR ZPAYPROC with this AE's run control (OPRID / RUN_CNTL_ID), so    */
+/* the SQR reads its file names from the same PS_Z_RUNCTL_PAYPRC row.              */
+/* The step must commit (Commit = After Step): Process Scheduler only sees the     */
+/* new PSPRCSRQST row once the AE transaction is committed.                        */
+
+Local ProcessRequest &rqst;
+
+&rqst = CreateProcessRequest("SQR Process", "ZPAYPROC");
+&rqst.RunControlID = Z_PAYPROC_AET.RUN_CNTL_ID;
+&rqst.OutDestType = "WEB";
+&rqst.OutDestFormat = "TXT";
+&rqst.Schedule();
+
+If &rqst.Status <> 0 Then
+   MessageBox(0, "", 0, 0, "Unable to schedule SQR ZPAYPROC (ProcessRequest status %1).", &rqst.Status);
+   Exit (1);
+End-If;
+
+Z_PAYPROC_AET.PRCSINSTANCE = &rqst.ProcessInstance;
+MessageBox(0, "", 0, 0, "Scheduled SQR ZPAYPROC, process instance %1.", Z_PAYPROC_AET.PRCSINSTANCE);

@@ -1,0 +1,34 @@
+/* Application Engine Z_PAYPROC, section MAIN, step WAIT, PeopleCode action.      */
+/* Waits for the SQR scheduled by step SCHEDULE and fails the AE (On Return =      */
+/* Abort) unless it finished with Success / Success With Warning.                  */
+/* PSPRCSRQST.RUNSTATUS: 1 Cancel, 2 Delete, 3 Error, 8 Cancelled, 9 Success,      */
+/* 10 Not Successful, 17 Success With Warning; other values are still in flight.   */
+
+Local JavaObject &thread = GetJavaClass("java.lang.Thread");
+Local integer &pollMillis = 10000;
+Local integer &maxPolls = 360; /* 1 hour */
+Local integer &polls = 0;
+Local string &runStatus = "";
+
+Repeat
+   &thread.sleep(&pollMillis);
+   &polls = &polls + 1;
+   SQLExec("SELECT RUNSTATUS FROM PSPRCSRQST WHERE PRCSINSTANCE = :1", Z_PAYPROC_AET.PRCSINSTANCE, &runStatus);
+Until &runStatus = "1" Or
+      &runStatus = "2" Or
+      &runStatus = "3" Or
+      &runStatus = "8" Or
+      &runStatus = "9" Or
+      &runStatus = "10" Or
+      &runStatus = "17" Or
+      &polls >= &maxPolls;
+
+Z_PAYPROC_AET.RUNSTATUS = &runStatus;
+
+If &runStatus <> "9" And
+      &runStatus <> "17" Then
+   MessageBox(0, "", 0, 0, "SQR ZPAYPROC (process instance %1) did not complete successfully: RUNSTATUS %2.", Z_PAYPROC_AET.PRCSINSTANCE, &runStatus);
+   Exit (1);
+End-If;
+
+MessageBox(0, "", 0, 0, "SQR ZPAYPROC (process instance %1) completed successfully.", Z_PAYPROC_AET.PRCSINSTANCE);
