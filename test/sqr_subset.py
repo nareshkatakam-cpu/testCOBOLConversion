@@ -11,6 +11,7 @@ BEGIN-SELECT blocks are parsed but fail if executed (no database here).
 Usage: sqr_subset.py PROGRAM.sqr [-I include_dir ...]
 """
 import argparse
+import functools
 import os
 import re
 import sys
@@ -79,6 +80,7 @@ TOKEN_RE = re.compile(r"""
     )""", re.X)
 
 
+@functools.lru_cache(maxsize=None)
 def tokenize(expr):
     pos, tokens = 0, []
     expr = expr.rstrip()
@@ -94,7 +96,7 @@ def tokenize(expr):
         elif kind == "word":
             val = val.lower()
         tokens.append((kind, val))
-    return tokens
+    return tuple(tokens)
 
 
 def to_dec(v):
@@ -154,9 +156,36 @@ FUNCTIONS = {
 }
 
 
+def _cmp(op, v, r):
+    if type(v) is not type(r):
+        raise SqrError(f"type mismatch comparing {v!r} {op} {r!r}")
+    res = {"=": v == r, "<>": v != r, "!=": v != r, "<": v < r,
+           ">": v > r, "<=": v <= r, ">=": v >= r}[op]
+    return Decimal(1 if res else 0)
+
+
+def _arith(op, v, r):
+    v, r = to_dec(v), to_dec(r)
+    if op == "+":
+        return v + r
+    if op == "-":
+        return v - r
+    if op == "*":
+        return v * r
+    return v / r
+
+
+@functools.lru_cache(maxsize=None)
+def compile_expr(expr):
+    """Compile an expression once into a function of a variable-lookup callable."""
+    return Expr(tokenize(expr)).parse()
+
+
 class Expr:
-    def __init__(self, tokens, lookup):
-        self.t, self.i, self.lookup = tokens, 0, lookup
+    """Recursive-descent parser producing closures: fn(lookup) -> value."""
+
+    def __init__(self, tokens):
+        self.t, self.i = tokens, 0
 
     def peek(self):
         return self.t[self.i] if self.i < len(self.t) else (None, None)
@@ -169,88 +198,89 @@ class Expr:
         return tok
 
     def parse(self):
-        v = self.p_or()
+        fn = self.p_or()
         if self.i != len(self.t):
             raise SqrError(f"trailing tokens: {self.t[self.i:]}")
-        return v
+        return fn
 
     def p_or(self):
-        v = self.p_and()
+        fn = self.p_and()
         while self.peek() == ("word", "or"):
             self.take()
-            r = self.p_and()
-            v = Decimal(1 if (v or r) else 0)
-        return v
+            l, r = fn, self.p_and()
+            fn = lambda lk, l=l, r=r: Decimal(1 if (l(lk) or r(lk)) else 0)
+        return fn
 
     def p_and(self):
-        v = self.p_not()
+        fn = self.p_not()
         while self.peek() == ("word", "and"):
             self.take()
-            r = self.p_not()
-            v = Decimal(1 if (v and r) else 0)
-        return v
+            l, r = fn, self.p_not()
+            fn = lambda lk, l=l, r=r: Decimal(1 if (l(lk) and r(lk)) else 0)
+        return fn
 
     def p_not(self):
         if self.peek() == ("word", "not"):
             self.take()
-            return Decimal(0 if self.p_not() else 1)
+            inner = self.p_not()
+            return lambda lk: Decimal(0 if inner(lk) else 1)
         return self.p_cmp()
 
     def p_cmp(self):
-        v = self.p_concat()
+        fn = self.p_concat()
         op = self.peek()[1]
         if op in ("=", "<>", "!=", "<", ">", "<=", ">="):
             self.take()
-            r = self.p_concat()
-            if type(v) is not type(r):
-                raise SqrError(f"type mismatch comparing {v!r} {op} {r!r}")
-            res = {"=": v == r, "<>": v != r, "!=": v != r, "<": v < r,
-                   ">": v > r, "<=": v <= r, ">=": v >= r}[op]
-            return Decimal(1 if res else 0)
-        return v
+            l, r = fn, self.p_concat()
+            return lambda lk: _cmp(op, l(lk), r(lk))
+        return fn
 
     def p_concat(self):
-        v = self.p_add()
+        fn = self.p_add()
         while self.peek()[1] == "||":
             self.take()
-            v = to_str(v) + to_str(self.p_add())
-        return v
+            l, r = fn, self.p_add()
+            fn = lambda lk, l=l, r=r: to_str(l(lk)) + to_str(r(lk))
+        return fn
 
     def p_add(self):
-        v = self.p_mul()
+        fn = self.p_mul()
         while self.peek()[1] in ("+", "-"):
             op = self.take()[1]
-            r = to_dec(self.p_mul())
-            v = to_dec(v) + r if op == "+" else to_dec(v) - r
-        return v
+            l, r = fn, self.p_mul()
+            fn = lambda lk, l=l, r=r, op=op: _arith(op, l(lk), r(lk))
+        return fn
 
     def p_mul(self):
-        v = self.p_unary()
+        fn = self.p_unary()
         while self.peek()[1] in ("*", "/"):
             op = self.take()[1]
-            r = to_dec(self.p_unary())
-            v = to_dec(v) * r if op == "*" else to_dec(v) / r
-        return v
+            l, r = fn, self.p_unary()
+            fn = lambda lk, l=l, r=r, op=op: _arith(op, l(lk), r(lk))
+        return fn
 
     def p_unary(self):
         if self.peek()[1] == "-":
             self.take()
-            return -to_dec(self.p_unary())
+            inner = self.p_unary()
+            return lambda lk: -to_dec(inner(lk))
         return self.p_atom()
 
     def p_atom(self):
         kind, val = self.take()
         if kind == "str":
-            return val
+            return lambda lk: val
         if kind == "num":
-            return Decimal(val)
+            d = Decimal(val)
+            return lambda lk: d
         if kind == "var":
-            return self.lookup(val)
+            return lambda lk: lk(val)
         if val == "(":
-            v = self.p_or()
+            fn = self.p_or()
             self.take(")")
-            return v
+            return fn
         if kind == "word" and val in FUNCTIONS:
+            func = FUNCTIONS[val]
             self.take("(")
             args = []
             if self.peek()[1] != ")":
@@ -259,7 +289,7 @@ class Expr:
                     self.take()
                     args.append(self.p_or())
             self.take(")")
-            return FUNCTIONS[val](*args)
+            return lambda lk: func(*[a(lk) for a in args])
         raise SqrError(f"unexpected token {val!r}")
 
 
@@ -292,7 +322,7 @@ class Interpreter:
                     i += 1
             elif low == "begin-program":
                 j = self.find_end(lines, i, "end-program")
-                self.program = lines[i + 1:j]
+                self.program = self.compile_block(lines[i + 1:j])
                 i = j
             elif low.startswith("begin-procedure"):
                 m = re.match(r"begin-procedure\s+([\w-]+)\s*(?:\((.*)\))?\s*(local)?\s*$", line, re.I)
@@ -301,7 +331,8 @@ class Interpreter:
                 params = [p.strip() for p in m.group(2).split(",")] if m.group(2) else []
                 j = self.find_end(lines, i, "end-procedure")
                 local = bool(m.group(2)) or bool(m.group(3))
-                self.procs[m.group(1).lower()] = Procedure(m.group(1), params, local, lines[i + 1:j])
+                self.procs[m.group(1).lower()] = Procedure(m.group(1), params, local,
+                                                           self.compile_block(lines[i + 1:j]))
                 i = j
             else:
                 raise SqrError(f"unexpected top-level line: {line}")
@@ -349,38 +380,54 @@ class Interpreter:
         scope[key] = value
 
     def eval(self, expr, frame):
-        return Expr(tokenize(expr), self.make_lookup(frame)).parse()
+        return compile_expr(expr)(self.make_lookup(frame))
 
     # execution
     def run(self):
         self.exec_block(self.program, None)
 
-    def exec_block(self, body, frame):
-        i = 0
+    def compile_block(self, body):
+        """Turn statement lines into nodes: ("if", cond, then, else), ("while", cond, body),
+        ("select", line) or ("stmt", line)."""
+        nodes, i = [], 0
         while i < len(body):
             line = body[i].strip()
             low = line.lower()
             word = low.split()[0]
             if word == "if":
                 j, else_at = self.match_block(body, i, "if", "end-if")
-                if self.eval(line[2:], frame):
-                    self.exec_block(body[i + 1:else_at if else_at else j], frame)
-                elif else_at:
-                    self.exec_block(body[else_at + 1:j], frame)
+                then_end = else_at if else_at else j
+                else_nodes = self.compile_block(body[else_at + 1:j]) if else_at else []
+                nodes.append(("if", line[2:], self.compile_block(body[i + 1:then_end]), else_nodes))
                 i = j
             elif word == "while":
                 j, _ = self.match_block(body, i, "while", "end-while")
-                try:
-                    while self.eval(line[5:], frame):
-                        self.exec_block(body[i + 1:j], frame)
-                except Break:
-                    pass
+                nodes.append(("while", line[5:], self.compile_block(body[i + 1:j])))
                 i = j
             elif low == "begin-select":
-                raise SqrError("BEGIN-SELECT executed: no database in the test interpreter")
+                j = self.find_end(body, i, "end-select")
+                nodes.append(("select", line))
+                i = j
             else:
-                self.exec_stmt(line, frame)
+                nodes.append(("stmt", line))
             i += 1
+        return nodes
+
+    def exec_block(self, nodes, frame):
+        for node in nodes:
+            kind = node[0]
+            if kind == "stmt":
+                self.exec_stmt(node[1], frame)
+            elif kind == "if":
+                self.exec_block(node[2] if self.eval(node[1], frame) else node[3], frame)
+            elif kind == "while":
+                try:
+                    while self.eval(node[1], frame):
+                        self.exec_block(node[2], frame)
+                except Break:
+                    pass
+            else:
+                raise SqrError("BEGIN-SELECT executed: no database in the test interpreter")
 
     @staticmethod
     def match_block(body, i, start, end):

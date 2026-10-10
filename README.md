@@ -68,3 +68,48 @@ semantics as the PL/SQL version (`Fit-Numeric`, `round(...)`, `Edit-Numeric`).
 available it executes the SQR source with `test/sqr_subset.py`, an interpreter for the
 subset of SQR that `ZPAYPROC.sqr` uses (PeopleSoft includes stubbed in
 `test/sqr_stubs/`); set `SQR_CMD` to run it against a real SQR installation.
+
+### Data validation (no PeopleSoft needed)
+
+`test/validate.py` runs the COBOL original and the SQR on many employee files and
+reconciles the outputs record by record. Needs only `cobc` (GnuCOBOL 3.x) and `python3`.
+
+```bash
+python3 test/validate.py                       # fixtures + edge cases + 3 x 1000 random + 10,050-record volume file
+python3 test/validate.py --random-files 10 --records 5000 --seed 42
+python3 test/validate.py my_employees.DAT      # also validate your own files
+SQR_CMD="sqr $PWD/sqr/ZPAYPROC.sqr ..." python3 test/validate.py   # real SQR runtime
+```
+
+For every input record it checks that both programs accept or reject it the same way,
+that EMP-ID, name, department, gross and net match for accepted records, and that the
+`INVALID ...` messages match for rejected ones. It also compares the totals and
+control totals (detail count, sum of net pay, accepted + rejected = input records), the
+report headers and widths, the missing-input-file behavior, and the report bytes.
+Results go to `test/results/`: `summary.md`, `reconciliation.csv` (one row per input
+record) and each program's report/console output per dataset. Exit status is 1 on any
+mismatch.
+
+Test files come from `test/generate_data.py` (deterministic for a given `--seed`):
+
+```bash
+python3 test/generate_data.py --profile edge   --out edge.DAT     # hand-picked edge cases
+python3 test/generate_data.py --profile mixed  --records 1000 --seed 7 --out mixed.DAT
+python3 test/generate_data.py --profile volume --records 10050 --out volume.DAT
+```
+
+Edge cases cover overtime boundaries (39.99 / 40.00 / 40.01 hours), maximum hours and
+rates, gross-pay overflow, rounding of tax, bad numeric fields (spaces, signs, decimal
+points, letters), bad and lower-case employee types, blank, short and long lines and
+duplicate IDs. `mixed` is about 80% valid random records and 20% invalid ones; `volume`
+is all valid and wraps the `9(4)` employee counter.
+
+**Known difference.** When the payroll total reaches $1,000,000 its top digit doesn't
+fit the `$Z,ZZZ,Z9.99` picture. GnuCOBOL then stops suppressing leading zeros
+(`$0,613,01.88`), while the SQR (like the PL/SQL version) suppresses them as usual
+(`$  613,01.88`); the printed value is the same. The validator reports this as
+"PASS (known difference)" rather than a failure. Any other difference fails.
+
+GitHub Actions (`.github/workflows/validate.yml`) runs `test/compare_sqr.sh` and
+`test/validate.py` on every pull request and uploads `summary.md` and
+`reconciliation.csv`.
